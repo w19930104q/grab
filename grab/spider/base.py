@@ -17,6 +17,7 @@ from grab.proxylist import BaseProxySource, ProxyList
 from grab.spider.cache_service import CacheReaderService, CacheWriterService
 from grab.spider.error import NoTaskHandler, SpiderError, SpiderMisuseError
 from grab.spider.http_api_service import HttpApiService
+from grab.spider.in_flight import InFlightLimiter
 from grab.spider.parser_service import ParserService
 from grab.spider.task import Task
 from grab.spider.task_dispatcher_service import TaskDispatcherService
@@ -130,6 +131,7 @@ class Spider(object):
         http_api_port=None,
         network_service="multicurl",
         grab_transport="pycurl",
+        in_flight_limit=None,
         # Deprecated
         transport=None,
     ):
@@ -150,6 +152,12 @@ class Spider(object):
         * retry_rebuild_user_agent - generate new random user-agent for each
             network request which is performed again due to network error
         * args - command line arguments parsed with `setup_arg_parser` method
+        * in_flight_limit - maximum number of task attempts being
+            processed at the same time. One attempt occupies a slot
+            from the moment it is about to read the document from
+            the cache or from the network till the moment the task
+            handler output is exhausted and the cache write of that
+            document has finished. Disabled (None) by default.
         """
 
         self.fatal_error_queue = Queue()
@@ -182,6 +190,21 @@ class Spider(object):
         self.network_try_limit = network_try_limit or int(
             self.config.get("network_try_limit", DEFAULT_NETWORK_TRY_LIMIT)
         )
+        if in_flight_limit is None:
+            in_flight_limit = self.config.get("in_flight_limit")
+        if in_flight_limit is not None:
+            if (
+                isinstance(in_flight_limit, bool)
+                or not isinstance(in_flight_limit, six.integer_types)
+                or in_flight_limit < 1
+            ):
+                raise SpiderMisuseError(
+                    "Value of in_flight_limit option should be "
+                    "a positive integer or None, got: %r" % (in_flight_limit,)
+                )
+            self.in_flight_limiter = InFlightLimiter(in_flight_limit)
+        else:
+            self.in_flight_limiter = None
         self._grab_config = {}
         if priority_mode not in ["random", "const"]:
             raise SpiderMisuseError(
@@ -431,6 +454,8 @@ class Spider(object):
             "Queue size: %d" % self.task_queue.size() if self.task_queue else "NA"
         )
         out.append("Network streams: %d" % self.thread_number)
+        if self.in_flight_limiter is not None:
+            out.append("In-flight limit: %d" % self.in_flight_limiter.limit)
         if self._started:
             elapsed = time.time() - self._started
         else:
@@ -640,9 +665,83 @@ class Spider(object):
 
     # pylint: enable=unused-argument
 
+    # *************************
+    # In-flight capacity limit
+    # *************************
+
+    def acquire_in_flight_slot(self, task, block=True):
+        """
+        Take an in-flight slot for the task attempt.
+
+        Must be called right before the attempt reads the document
+        from the cache or from the network. If the task already owns
+        a slot (e.g. it was acquired by the cache reader service and
+        the cache missed) then no new slot is acquired.
+
+        Returns True if the attempt may proceed. Returns False if
+        the limiter has been shut down (the spider is stopping) or,
+        with ``block=False``, if no slot is currently free.
+        """
+        limiter = self.in_flight_limiter
+        if limiter is None:
+            return True
+        # pylint: disable=protected-access
+        if getattr(task, "_in_flight_token", None) is not None:
+            return True
+        token = limiter.acquire(block=block)
+        if token is None:
+            return False
+        task._in_flight_token = token
+        # pylint: enable=protected-access
+        return True
+
+    def release_in_flight_slot(self, task):
+        """
+        Abort the task attempt and release its in-flight slot (if any).
+
+        Used for failed attempts and for tasks dropped without
+        being processed.
+        """
+        # pylint: disable=protected-access
+        token = getattr(task, "_in_flight_token", None)
+        if token is not None:
+            task._in_flight_token = None
+            token.abort()
+        # pylint: enable=protected-access
+
+    def expect_in_flight_cache_write(self, task):
+        """
+        Register a cache write for the task attempt: the in-flight
+        slot is released only after that cache write has finished.
+        """
+        # pylint: disable=protected-access
+        token = getattr(task, "_in_flight_token", None)
+        if token is not None:
+            token.expect_cache_write()
+        # pylint: enable=protected-access
+
+    def complete_in_flight_stage(self, task):
+        """
+        Mark one processing stage (parsing or cache writing) of the
+        task attempt as finished.
+        """
+        # pylint: disable=protected-access
+        token = getattr(task, "_in_flight_token", None)
+        if token is not None:
+            token.complete()
+        # pylint: enable=protected-access
+
+    def shutdown_in_flight_limiter(self):
+        """
+        Wake up all threads waiting for a free in-flight slot.
+        """
+        if self.in_flight_limiter is not None:
+            self.in_flight_limiter.shutdown()
+
     def submit_task_to_transport(self, task, grab):
         if self.only_cache:
             self.stat.inc("spider:request-network-disabled-only-cache")
+            self.release_in_flight_slot(task)
         else:
             grab_config_backup = grab.dump_config()
             self.process_grab_proxy(task, grab)
@@ -653,6 +752,7 @@ class Spider(object):
                     task, grab, grab_config_backup
                 )
             except GrabInvalidUrl:
+                self.release_in_flight_slot(task)
                 # TODO: log error
                 # TODO: show traceback
                 logger.debug("Task %s has invalid URL: %s", task.name, task.url)
@@ -703,6 +803,9 @@ class Spider(object):
             raise
         finally:
             # TODO:
+            # Wake up threads waiting for a free in-flight slot
+            # so that services could process the stop signal
+            self.shutdown_in_flight_limiter()
             if self.task_queue:
                 self.task_queue.clear()
                 self.task_queue.close()
@@ -742,6 +845,8 @@ class Spider(object):
                 not self.cache_reader_service.input_queue.size()
                 and not self.cache_writer_service.input_queue.qsize()
             )
+        if result and self.in_flight_limiter is not None:
+            result = result and self.in_flight_limiter.in_flight == 0
         return result
 
     def log_failed_network_result(self, res):

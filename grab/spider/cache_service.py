@@ -36,19 +36,31 @@ class CacheReaderService(CacheServiceBase):
             except Empty:
                 time.sleep(0.1)
             else:
-                grab = self.spider.setup_grab_for_task(task)
-                item = None
-                if self.is_read_allowed(task, grab):
-                    item = self.load_from_cache(task, grab)
-                    if item:
-                        result, task = item
+                # Take the in-flight slot before reading the document
+                # from the cache. If the cache misses, the slot travels
+                # with the task to the network service, so the attempt
+                # does not occupy two slots.
+                if not self.spider.acquire_in_flight_slot(task):
+                    # The spider is stopping, drop the task
+                    self.spider.stat.inc("spider:in-flight-dropped")
+                    continue
+                try:
+                    grab = self.spider.setup_grab_for_task(task)
+                    item = None
+                    if self.is_read_allowed(task, grab):
+                        item = self.load_from_cache(task, grab)
+                        if item:
+                            result, task = item
+                            self.spider.task_dispatcher.input_queue.put(
+                                (result, task, None)
+                            )
+                    if not item:
                         self.spider.task_dispatcher.input_queue.put(
-                            (result, task, None)
+                            (task, None, {"source": "cache_reader"})
                         )
-                if not item:
-                    self.spider.task_dispatcher.input_queue.put(
-                        (task, None, {"source": "cache_reader"})
-                    )
+                except Exception:
+                    self.spider.release_in_flight_slot(task)
+                    raise
 
     def is_read_allowed(self, task, grab):
         return (
@@ -88,8 +100,13 @@ class CacheWriterService(CacheServiceBase):
             except Empty:
                 pass
             else:
-                if self.is_write_allowed(task, grab):
-                    self.backend.save_response(task.url, grab)
+                try:
+                    if self.is_write_allowed(task, grab):
+                        self.backend.save_response(task.url, grab)
+                finally:
+                    # The in-flight slot of the task attempt is held
+                    # till this cache write has finished
+                    self.spider.complete_in_flight_stage(task)
 
     def is_write_allowed(self, task, grab):
         return (

@@ -52,6 +52,11 @@ class NetworkServiceThreaded(BaseService):
                                     'spider:'
                                     'request-network-disabled-only-cache'
                                 )
+                                self.spider.release_in_flight_slot(task)
+                            elif not self.spider.acquire_in_flight_slot(task):
+                                # The spider is stopping (the in-flight
+                                # limiter has been shut down), drop the task
+                                self.spider.stat.inc('spider:in-flight-dropped')
                             else:
                                 grab_config_backup = grab.dump_config()
                                 self.spider.process_grab_proxy(task, grab)
@@ -112,6 +117,9 @@ class NetworkServiceThreaded(BaseService):
                                         })
                                     (self.spider.task_dispatcher
                                      .input_queue.put((result, task, None)))
+                                except Exception:
+                                    self.spider.release_in_flight_slot(task)
+                                    raise
                                 finally:
                                     pass
                                     #self.freelist.append(1)

@@ -75,6 +75,9 @@ class TaskDispatcherService(BaseService):
                 and not result.get("from_cache")
                 and result["ok"]
             ):
+                # The in-flight slot of the task attempt is released
+                # only after this cache write has finished
+                self.spider.expect_in_flight_cache_write(task)
                 self.spider.cache_writer_service.input_queue.put((task, result["grab"]))
             # TODO: Move to network service
             # starts
@@ -89,6 +92,10 @@ class TaskDispatcherService(BaseService):
             if is_valid:
                 self.spider.parser_service.input_queue.put((result, task))
             else:
+                # The attempt has failed: release its in-flight slot.
+                # The retry (see below) is a new attempt and acquires
+                # a new slot.
+                self.spider.release_in_flight_slot(task)
                 self.spider.log_failed_network_result(result)
                 # Try to do network request one more time
                 # TODO:

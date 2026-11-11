@@ -70,6 +70,10 @@ class ParserService(BaseService):
                             return
                 finally:
                     worker.is_busy_event.clear()
+                    # The task handler output has been fully consumed
+                    # (or the handler has failed): the parse stage of
+                    # the task attempt is finished
+                    self.spider.complete_in_flight_stage(task)
 
     def execute_task_handler(self, handler, result, task):
         # pylint: disable=broad-except

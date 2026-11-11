@@ -177,6 +177,10 @@ class Task(BaseTask):
 
         # First, create exact copy of the current Task object
         attr_copy = self.__dict__.copy()
+        # The in-flight capacity token (see Spider `in_flight_limit`
+        # option) must not leak into the clone: the clone is a new
+        # task attempt and has to acquire its own slot.
+        attr_copy.pop('_in_flight_token', None)
         if attr_copy.get('grab_config') is not None:
             del attr_copy['url']
         if not attr_copy['priority_set_explicitly']:

@@ -62,6 +62,7 @@ SPIDER_TEST_LIST = (
     "tests.spider_cache",  # backends: mongodb, mysql, postgresql
     #'tests.spider_data',
     "tests.spider_error",
+    "tests.spider_in_flight_limit",
     "tests.spider_meta",
     "tests.spider_misc",
     "tests.spider_multiprocess",

@@ -153,18 +153,54 @@ class NetworkServiceMulticurl(BaseService):
                 else:
                     worker.is_busy_event.set()
                     try:
-                        task.network_try_count += 1 # pylint: disable=no-member
-                        is_valid, reason = self.spider.check_task_limits(task)
-                        if is_valid:
-                            grab = self.spider.setup_grab_for_task(task)
-                            self.spider.submit_task_to_transport(task, grab)
+                        # Do not block here waiting for a free
+                        # in-flight slot: this thread also collects
+                        # network results (see `iterate_results`
+                        # below) and blocking it would stall
+                        # dispatching, parsing and cache writing.
+                        if not self.spider.acquire_in_flight_slot(
+                                task, block=False):
+                            limiter = self.spider.in_flight_limiter
+                            if limiter is not None \
+                                    and limiter.is_shutdown:
+                                # The spider is stopping,
+                                # drop the task
+                                self.spider.stat.inc(
+                                    'spider:in-flight-dropped'
+                                )
+                            else:
+                                # All in-flight slots are busy:
+                                # postpone the new attempt, put
+                                # the task back into the queue
+                                self.spider.stat.inc(
+                                    'spider:in-flight-deferred'
+                                )
+                                self.spider.task_queue.put(
+                                    task,
+                                    priority=task.priority,
+                                    schedule_time=task.schedule_time,
+                                )
+                                time.sleep(0.05)
                         else:
-                            self.spider.log_rejected_task(task, reason)
-                            # pylint: disable=no-member
-                            handler = task.get_fallback_handler(self.spider)
-                            # pylint: enable=no-member
-                            if handler:
-                                handler(task)
+                            task.network_try_count += 1 # pylint: disable=no-member
+                            is_valid, reason = self.spider.check_task_limits(task)
+                            if is_valid:
+                                grab = self.spider.setup_grab_for_task(task)
+                                try:
+                                    self.spider.submit_task_to_transport(
+                                        task, grab
+                                    )
+                                except Exception:
+                                    self.spider.release_in_flight_slot(task)
+                                    raise
+                            else:
+                                self.spider.release_in_flight_slot(task)
+                                self.spider.log_rejected_task(task, reason)
+                                # pylint: disable=no-member
+                                handler = task.get_fallback_handler(self.spider)
+                                # pylint: enable=no-member
+                                if handler:
+                                    handler(task)
                     finally:
                         worker.is_busy_event.clear()
 

@@ -85,6 +85,7 @@ crawlers.
     spider/cache
     spider/error_handling
     spider/transport
+    spider/in_flight_limit
 
 ..
     spider/proxy - new
